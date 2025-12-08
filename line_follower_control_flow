@@ -1,0 +1,38 @@
+// PID Line Follower Control Flow
+digraph Line_Follower_Control_System {
+	rankdir=LR
+	node [fillcolor="#E0FFFF" shape=box style=filled]
+	IR_Sensors [label="3x IR Line Sensors (L, M, R)" fillcolor="#CCFFCC" shape=cylinder]
+	IMU [label="MPU6050 (Gyro Z, Accel)" fillcolor="#CCFFCC" shape=cylinder]
+	Line_Detect [label="Read Analog Values
+> lineThreshold (500)" fillcolor="#FFFFCC" shape=ellipse]
+	Error_Calc [label="Simple Error Calculation
+(-1, 0, +1)" fillcolor="#FFFFCC"]
+	PID_P [label="P-Term (Kp * Error)" fillcolor="#F0FFF0"]
+	PID_I [label="I-Term (Ki * Integral)" fillcolor="#F0FFF0"]
+	PID_D [label="D-Term (Kd * Derivative)" fillcolor="#F0FFF0"]
+	Gyro_D [label="Gyro-Term (Kgyro * RateOfTurn)" fillcolor="#F0FFF0"]
+	PID_Sum [label="PID Output Summation" fillcolor="#ADFFAD" shape=Mdiamond]
+	Map_Speed [label="Map PID Output to Speed Offset" fillcolor="#DDDDFF"]
+	Constrain [label="Constrain(0, 150)" fillcolor="#DDDDFF"]
+	Motors [label="H-Bridge Motor Driver
+(PWM Speed, Direction)" fillcolor="#FFCCCC" shape=trapezium]
+	Search [label="Line Lost: Search & Recovery
+(Uses lastKnownDirection)" fillcolor="#F08080" shape=house]
+	IR_Sensors -> Line_Detect [label="Raw Values"]
+	Line_Detect -> Error_Calc [label="Boolean On/Off"]
+	IMU -> Gyro_D [label="Rate of Turn (Gyro Z)"]
+	Error_Calc -> PID_P [label=Error]
+	Error_Calc -> PID_I [label=Error]
+	Error_Calc -> PID_D [label=Error]
+	Line_Detect -> Search [label="All Sensors Off" color=red style=dashed]
+	Search -> Motors [label="Fixed Turn Speed" color=red style=dashed]
+	PID_P -> PID_Sum
+	PID_I -> PID_Sum
+	PID_D -> PID_Sum
+	Gyro_D -> PID_Sum [label=Stabilization]
+	PID_Sum -> Map_Speed [label="Correction Signal"]
+	Map_Speed -> Constrain [label="Speed Offset"]
+	Constrain -> Motors [label="Left/Right Speed (0-150)"]
+	Motors -> IR_Sensors [label="Robot Movement/Adjustment" color=blue style=bold]
+}
