@@ -1,6 +1,7 @@
 /*================================================================
   FINAL CODE: FUSION PID LINE FOLLOWER (IR + GYRO)
-  UPDATED MOTOR DRIVER PINS (Simplified 2-Pin Direction + STBY)
+  
+  ** USES ANALOG IR SENSORS (A2, A1, A0) FOR MEASUREMENT **
 ================================================================*/
 
 #include <Arduino.h> // Standard Arduino functions
@@ -11,20 +12,22 @@
 // ================================================================
 
 // --- SENSORS (Analog Pins) ---
-const int rightIRPin  = A0; 
-const int middleIRPin = A1; 
-const int leftIRPin   = A2; 
+// Note: These pins must be used with analogRead()
+const int pinL = A2;  // Left IR Sensor
+const int pinC = A1;  // Center IR Sensor
+const int pinR = A0;  // Right IR Sensor
 
 // --- MPU6050 (I2C Pins) ---
-const int SCL_Pin = A5;
-const int SDA_Pin = A4;
+const int MPU_ADDR = 0x68;
+const int SCL_Pin = A5; // Clock (Handled by Wire.h)
+const int SDA_Pin = A4; // Data (Handled by Wire.h)
 
-// --- MOTORS (Simplified L298N/Motor Shield Setup) ---
-const PIN_Motor_PWMA 5    // Speed control (PWM) for Motor A (Right)
-const PIN_Motor_PWMB 6    // Speed control (PWM) for Motor B (Left)
-const PIN_Motor_AIN_1 7   // Direction control for Motor A (Right)
-const PIN_Motor_BIN_1 8   // Direction control for Motor B (Left)
-const PIN_Motor_STBY  3   // Standby pin
+// --- MOTORS (Simplified 2-Pin Direction + STBY Setup) ---
+const int PIN_Motor_PWMA = 5;    // PWM Speed for Motor A (Right)
+const int PIN_Motor_PWMB = 6;    // PWM Speed for Motor B (Left)
+const int PIN_Motor_AIN_1 = 7;   // Direction control for Motor A (Right)
+const int PIN_Motor_BIN_1 = 8;   // Direction control for Motor B (Left)
+const int PIN_Motor_STBY = 3;    // Standby pin
 
 
 // ================================================================
@@ -33,26 +36,39 @@ const PIN_Motor_STBY  3   // Standby pin
 
 const int lineThreshold = 500; // Analog value > 500 means "ON LINE"
 const int maxPWM = 255;
-int baseSpeed = 100;      // Default cruising speed (0-maxPWM)
-int maxSpeed  = 180;      // Cap the maximum speed
+int baseSpeed = 50;      // Default cruising speed (0-maxPWM)
+int maxSpeed  = 100;      // Cap the maximum speed
 
 // PID Constants (Tuning is ESSENTIAL)
-double Kp = 0.15;     // Proportional
+double Kp = 0.02;     // Proportional
 double Ki = 0.0001;   // Integral
 double Kd = 2.0;      // Derivative
 
+// Fusion Parameters
+float FILTER_GAIN = 0.1; // 0.1 = Trust Sensors 10%, Trust Gyro 90% (Very smooth)
+float GYRO_SCALE = 2.0;  // Multiplier to convert Rotation Speed -> Lateral Position change
+
 
 // ==========================================
-//          CLASS: MOTOR DRIVER (REVISED)
+//              GLOBAL VARIABLES
+// ==========================================
+float estimatedPosition = 0; // The Fused Position (-1000 to 1000)
+float gyroErrorZ = 0;
+unsigned long lastTime;
+float lastError = 0;
+float integral = 0;
+
+
+// ==========================================
+//          CLASS: MOTOR DRIVER 
 // ==========================================
 class MotorDriver {
   private:
     int pwma, pwmb;  // PWM Pins
-    int ain1, bin1;  // Direction Pins (AIN1 for Motor A, BIN1 for Motor B)
+    int ain1, bin1;  // Direction Pins 
     int stby;        // Standby Pin
 
   public:
-    // Constructor using the new defined pins
     MotorDriver(int pA, int pB, int dA, int dB, int s) {
       pwma = pA; pwmb = pB; 
       ain1 = dA; bin1 = dB;
@@ -60,39 +76,36 @@ class MotorDriver {
     }
 
     void init() {
-      pinMode(pwma, OUTPUT); pinMode(pwmb, OUTPUT); 
-      pinMode(ain1, OUTPUT); pinMode(bin1, OUTPUT);
+      pinMode(pwma, OUTPUT); 
+      pinMode(pwmb, OUTPUT); 
+      pinMode(ain1, OUTPUT); 
+      pinMode(bin1, OUTPUT);
       pinMode(stby, OUTPUT); 
 
       // Enable motor driver
       digitalWrite(stby, HIGH);
-      
-      // Start stopped
       drive(0, 0);
     }
 
     void drive(int speedLeft, int speedRight) {
-      // Constrain speed to safe range
       speedLeft = constrain(speedLeft, -maxSpeed, maxSpeed);
       speedRight = constrain(speedRight, -maxSpeed, maxSpeed);
 
       // --- Motor B (Left) Logic ---
-      // Direction is set by BIN_1 pin (HIGH = Forward, LOW = Reverse, or vice-versa)
       if (speedLeft >= 0) { // Forward
-        digitalWrite(bin1, HIGH); // Assuming HIGH is forward for Left Motor
+        digitalWrite(bin1, HIGH); 
         analogWrite(pwmb, speedLeft);
       } else { // Backward
-        digitalWrite(bin1, LOW);  // Assuming LOW is backward for Left Motor
+        digitalWrite(bin1, LOW);  
         analogWrite(pwmb, -speedLeft);
       }
 
       // --- Motor A (Right) Logic ---
-      // Direction is set by AIN_1 pin
       if (speedRight >= 0) { // Forward
-        digitalWrite(ain1, HIGH); // Assuming HIGH is forward for Right Motor
+        digitalWrite(ain1, HIGH); 
         analogWrite(pwma, speedRight);
       } else { // Backward
-        digitalWrite(ain1, LOW);  // Assuming LOW is backward for Right Motor
+        digitalWrite(ain1, LOW);  
         analogWrite(pwma, -speedRight);
       }
     }
@@ -104,142 +117,125 @@ class MotorDriver {
 
 // ==========================================
 //          CLASS: PID CONTROLLER
-//          (No changes needed here)
+//          (Simplified as a global function)
 // ==========================================
-class PID {
-  private:
-    float kp, ki, kd;
-    float previousError, integral;
-    
-  public:
-    PID(float p, float i, float d) {
-      kp = p; ki = i; kd = d;
-      previousError = 0; integral = 0;
-    }
+float computePID(float error, float dt) {
+  // P Term
+  float P = error;
+  
+  // I Term
+  integral += error * dt;
+  // Anti-windup (Limit I to prevent getting stuck)
+  integral = constrain(integral, -1000, 1000); 
+  
+  // D Term
+  float D = (error - lastError) / dt;
+  lastError = error;
 
-    float compute(float error, float dt) {
-      float P = error * kp;
-      
-      integral += error * dt;
-      integral = constrain(integral, -5000, 5000); 
-      float I = integral * ki;
-      
-      float D = ((error - previousError) / dt) * kd;
-      previousError = error;
+  // PID Calculation
+  return (Kp * P) + (Ki * integral) + (Kd * D);
+}
 
-      return P + I + D;
-    }
-};
 
 // ==========================================
-//          CLASS: FUSION ROBOT
-//          (No changes needed here)
+//          HELPER FUNCTIONS
 // ==========================================
-class FusionRobot {
-  private:
-    int pinL, pinC, pinR;
-    const int MPU_ADDR = 0x68;
-    float gyroErrorZ;       
-    float currentPosition;  
-    float fusionGain;       
 
-  public:
-    FusionRobot(int l, int c, int r) {
-      pinL = l; pinC = c; pinR = r;
-      currentPosition = 0;
-      fusionGain = 0.1; 
-    }
+int16_t readRawGyro() {
+  Wire.beginTransmission(MPU_ADDR);
+  Wire.write(0x47); // Register for Gyro Z
+  Wire.endTransmission(false);
+  Wire.requestFrom(MPU_ADDR, 2, true);
+  return (Wire.read() << 8 | Wire.read());
+}
 
-    void init() {
-      Wire.begin();
-      Wire.beginTransmission(MPU_ADDR);
-      Wire.write(0x6B); Wire.write(0); 
-      Wire.endTransmission(true);
-
-      calibrateGyro();
-    }
-
-    void calibrateGyro() {
-      Serial.println("Calibrating Gyro... Keep robot still!");
-      float sum = 0;
-      for(int i=0; i<500; i++) {
-        sum += readRawGyro();
-        delay(2);
-      }
-      gyroErrorZ = sum / 500.0;
-      Serial.print("Gyro Bias: "); Serial.println(gyroErrorZ);
-    }
-
-    int16_t readRawGyro() {
-      Wire.beginTransmission(MPU_ADDR);
-      Wire.write(0x47); 
-      Wire.endTransmission(false);
-      Wire.requestFrom(MPU_ADDR, 2, true);
-      return (Wire.read() << 8 | Wire.read());
-    }
-
-    float getPosition(float dt) {
-      float rotationRate = (readRawGyro() - gyroErrorZ) / 131.0; 
-      float prediction = currentPosition + (-rotationRate * 2.0 * dt); 
-
-      int L = (analogRead(pinL) > lineThreshold);
-      int C = (analogRead(pinC) > lineThreshold);
-      int R = (analogRead(pinR) > lineThreshold);
-      int sum = L + C + R;
-
-      if (sum > 0) {
-        float measuredPos = ((L * -1000) + (C * 0) + (R * 1000)) / (float)sum;
-        currentPosition = ((1.0 - fusionGain) * prediction) + (fusionGain * measuredPos);
-      } else {
-        currentPosition = prediction;
-      }
-      
-      return currentPosition;
-    }
-};
-
-// ==========================================
-//              MAIN SKETCH
-// ==========================================
+// ------------------------------------------
+//            MAIN SETUP AND LOOP
+// ------------------------------------------
 
 // 1. Instantiate Objects
-// Motors: (PWMA=5, PWMB=6, AIN1=7, BIN1=8, STBY=3)
 MotorDriver motors(PIN_Motor_PWMA, PIN_Motor_PWMB, PIN_Motor_AIN_1, PIN_Motor_BIN_1, PIN_Motor_STBY); 
-// PID: (Kp, Ki, Kd)
-PID steeringPID(Kp, Ki, Kd);   
-// Robot: (L=A2, C=A1, R=A0)
-FusionRobot robot(leftIRPin, middleIRPin, rightIRPin);        
-
-unsigned long lastTime;
 
 void setup() {
   Serial.begin(9600);
-  motors.init();
-  robot.init(); 
+  Wire.begin();
+
+  // --- PIN MODES ---
+  motors.init(); // Sets motor pin modes and enables standby
+  
+  // --- GYRO SETUP & CALIBRATION ---
+  Wire.beginTransmission(MPU_ADDR);
+  Wire.write(0x6B); // Power Mgmt
+  Wire.write(0);    // Wake up
+  Wire.endTransmission(true);
+
+  Serial.println("Calibrating Gyro... DO NOT MOVE ROBOT");
+  for (int i = 0; i < 500; i++) {
+    gyroErrorZ += readRawGyro();
+    delay(2);
+  }
+  gyroErrorZ /= 500.0;
+  Serial.println("Calibration Done.");
+  
   lastTime = millis();
 }
 
 void loop() {
-  // Time Calculation for Math (dt) in seconds
-  unsigned long now = millis();
-  float dt = (now - lastTime) / 1000.0;
-  lastTime = now;
+  // 1. Calculate Time Delta
+  unsigned long currentTime = millis();
+  float dt = (currentTime - lastTime) / 1000.0; // Seconds
+  lastTime = currentTime;
 
-  // 1. Get Fused Position 
-  float position = robot.getPosition(dt);
+  // ==========================================
+  //        STEP 1: SENSOR FUSION
+  // ==========================================
+  
+  // A. PREDICTION (Gyroscope)
+  float rotationRate = (readRawGyro() - gyroErrorZ) / 131.0;
+  float predictedChange = -rotationRate * GYRO_SCALE * dt; // Multiply by dt
+  estimatedPosition += predictedChange;
 
-  // 2. Calculate PID Error
-  float error = 0 - position;
-  float correction = steeringPID.compute(error, dt);
+  // B. MEASUREMENT (IR Analog Reading)
+  // Convert analog reading to boolean (1=On Line, 0=Off Line)
+  int L = (analogRead(pinL) > lineThreshold); 
+  int C = (analogRead(pinC) > lineThreshold);
+  int R = (analogRead(pinR) > lineThreshold); 
+  
+  int sum = L + C + R;
+  
+  if (sum > 0) {
+    // Calculate Weighted Position: L = -1000, C = 0, R = 1000
+    float measuredPos = ((L * -1000) + (C * 0) + (R * 1000)) / (float)sum;
+    
+    // FUSION: Combine Prediction (Smooth Gyro) with Measurement (Accurate IR)
+    // Complementary Filter: Fused = (Trust Gyro) * Prediction + (Trust IR) * Measurement
+    estimatedPosition = ((1.0 - FILTER_GAIN) * estimatedPosition) + (FILTER_GAIN * measuredPos);
+  } 
+  // If sum == 0 (GAP DETECTED), the 'estimatedPosition' retains the Gyro prediction.
 
-  // 3. Drive Motors
-  // Motor A (Right) uses PWMA, Motor B (Left) uses PWMB
-  float speedRight = baseSpeed + correction;
-  float speedLeft  = baseSpeed - correction;
+  // ==========================================
+  //        STEP 2: PID CONTROL
+  // ==========================================
+  
+  float error = 0 - estimatedPosition;
+  float correction = computePID(error, dt);
+
+  // ==========================================
+  //        STEP 3: MOTOR DRIVER
+  // ==========================================
+  
+  // Calculate differential speeds
+  float speedLeft = baseSpeed - correction;
+  float speedRight = baseSpeed + correction; // Note the addition here
+  
+  // Constrain speeds to 0-maxPWM range 
+  // (The drive function handles the forward/reverse logic for negative speeds)
+  speedLeft = constrain(speedLeft, -maxPWM, maxPWM);
+  speedRight = constrain(speedRight, -maxPWM, maxPWM);
   
   motors.drive(speedLeft, speedRight);
   
   // Debugging
-  Serial.print("Pos:"); Serial.print(position);
+  Serial.print("Pos:"); Serial.print(estimatedPosition);
   Serial.print(" Err:"); Serial.println(correction);
 }
